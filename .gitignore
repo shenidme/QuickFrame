@@ -1,0 +1,11 @@
+/bin/
+/dist/
+/work/
+settings.ini
+settings.ini.bak
+*.tmp
+*-test.txt
+*.exe
+*.pdb
+.vs/
+Thumbs.db

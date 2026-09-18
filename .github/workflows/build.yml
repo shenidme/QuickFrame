@@ -1,0 +1,27 @@
+name: Windows build
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, test and package
+        shell: pwsh
+        run: ./build.ps1 -Test -Package
+      - name: Upload portable Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickFrame-windows
+          path: |
+            dist/QuickFrame-windows.zip
+            dist/SHA256SUMS.txt
