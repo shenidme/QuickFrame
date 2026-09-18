@@ -23,6 +23,11 @@ static class Native {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr icon);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window,out uint process);
+    [StructLayout(LayoutKind.Sequential)] public struct BitmapHeader { public uint Size; public int Width,Height; public ushort Planes,Bits; public uint Compression,ImageSize; public int XPels,YPels; public uint Used,Important; }
+    [DllImport("gdi32.dll",SetLastError=true)] public static extern IntPtr CreateDIBSection(IntPtr dc,ref BitmapHeader info,uint usage,out IntPtr bits,IntPtr section,uint offset);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr window,IntPtr after,int x,int y,int width,int height,uint flags);
     [StructLayout(LayoutKind.Sequential)] public struct Size { public int X,Y; }
     [StructLayout(LayoutKind.Sequential,Pack=1)] public struct Blend { public byte Op,Flags,Alpha,Format; }
@@ -58,11 +63,12 @@ class Gesture {
 }
 
 enum FrameStyle { Cyber, Rainbow, Classic, Aurora, Amber, Mint, NightCity }
+enum TriggerMode { Right, AltRight, SideBack, SideForward }
 
 // No painting or synchronous UI calls are allowed on the low-level hook thread.
 class MouseInput : IDisposable {
     public class Stroke { public Rectangle Rect; public long Born,Released; }
-    public class Snapshot { public Rectangle? Preview; public long Born; public List<Stroke> Completed; }
+    public class Snapshot { public Rectangle? Preview; public long Born; public List<Stroke> Completed; public bool Clear; }
     readonly object gate=new object();
     readonly Gesture gesture=new Gesture();
     readonly List<Stroke> completed=new List<Stroke>();
@@ -70,7 +76,14 @@ class MouseInput : IDisposable {
     readonly System.Threading.Thread thread;
     readonly System.Threading.ManualResetEvent ready=new System.Threading.ManualResetEvent(false);
     readonly Native.HookProc callback;
+    readonly Native.HookProc keyboardCallback;
     IntPtr hook;
+    IntPtr keyboardHook;
+    TriggerMode trigger=TriggerMode.Right;
+    int heldButton=2;
+    string[] excludedApps=new string[0];
+    bool appExcluded,clearRequested,escapeHeld;
+    public volatile bool CaptureEscape;
     Exception startupError;
     long born,lastInput,lastInstall;
     Point lastPoint;
@@ -81,7 +94,7 @@ class MouseInput : IDisposable {
     public long Heartbeats,InstallCount;
     Control dispatcher;
     public MouseInput(Stopwatch time) {
-        clock=time; callback=OnMouse;
+        clock=time; callback=OnMouse; keyboardCallback=OnKeyboard;
         thread=new System.Threading.Thread(Run) { IsBackground=true,Name="QuickFrame mouse input" };
         thread.SetApartmentState(System.Threading.ApartmentState.STA); thread.Start();
         if(!ready.WaitOne(5000)) throw new Exception("鼠标监听线程启动超时。");
@@ -100,10 +113,13 @@ class MouseInput : IDisposable {
         try {
             dispatcher=new Control(); var dispatcherHandle=dispatcher.Handle;
             Install();
+            keyboardHook=Native.SetWindowsHookEx(13,keyboardCallback,Native.GetModuleHandle(null),0);
+            if(keyboardHook==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             using(var watchdog=new Timer { Interval=250 }) {
                 watchdog.Tick+=delegate {
                     System.Threading.Interlocked.Increment(ref Heartbeats);
                     if(stopping) { Application.ExitThread(); return; }
+                    UpdateForeground();
                     bool restart=repair; repair=false;
                     Native.Point cursor;
                     lock(gate) {
@@ -119,15 +135,36 @@ class MouseInput : IDisposable {
                 watchdog.Start(); ready.Set(); Application.Run();
             }
         } catch(Exception e) { startupError=e; ready.Set(); }
-        finally { if(hook!=IntPtr.Zero) Native.UnhookWindowsHookEx(hook); Installed=false; if(dispatcher!=null) dispatcher.Dispose(); }
+        finally { if(hook!=IntPtr.Zero) Native.UnhookWindowsHookEx(hook); if(keyboardHook!=IntPtr.Zero) Native.UnhookWindowsHookEx(keyboardHook); Installed=false; if(dispatcher!=null) dispatcher.Dispose(); }
     }
-    public void SetEnabled(bool value) { lock(gate) { enabled=value; discarded=true; completed.Clear(); } }
+    public void SetEnabled(bool value) { lock(gate) { if(enabled==value) return; enabled=value; discarded=true; completed.Clear(); } }
     public void Cancel() { lock(gate) { discarded=true; completed.Clear(); } }
     public void Repair() { Cancel(); repair=true; }
+    public void Configure(TriggerMode value,string excluded) { lock(gate) { trigger=value; excludedApps=excluded.Split(new char[]{';',',','\n'},StringSplitOptions.RemoveEmptyEntries); } }
+    void UpdateForeground() {
+        string[] apps; lock(gate) apps=excludedApps;
+        bool blocked=false;
+        if(apps.Length>0) try {
+            uint pid; Native.GetWindowThreadProcessId(Native.GetForegroundWindow(),out pid);
+            using(var process=Process.GetProcessById((int)pid)) foreach(string name in apps)
+                if(string.Equals(Path.GetFileNameWithoutExtension(name.Trim()),process.ProcessName,StringComparison.OrdinalIgnoreCase)) blocked=true;
+        } catch(ArgumentException) { } catch(System.ComponentModel.Win32Exception) { }
+        lock(gate) appExcluded=blocked;
+    }
+    IntPtr OnKeyboard(int code,IntPtr message,IntPtr data) {
+        if(code>=0 && Marshal.ReadInt32(data)==27) {
+            int msg=message.ToInt32();
+            lock(gate) {
+                if((msg==0x100 || msg==0x104) && (CaptureEscape || (gesture.Pending&&!discarded) || escapeHeld)) { discarded=true; completed.Clear(); clearRequested=true; escapeHeld=true; return (IntPtr)1; }
+                if((msg==0x101 || msg==0x105) && escapeHeld) { escapeHeld=false; return (IntPtr)1; }
+            }
+        }
+        return Native.CallNextHookEx(keyboardHook,code,message,data);
+    }
     public Snapshot Read() {
         lock(gate) {
-            var result=new Snapshot { Preview=gesture.Pending&&gesture.Dragging&&!discarded?(Rectangle?)gesture.Rect:null,Born=born,Completed=new List<Stroke>(completed) };
-            completed.Clear(); return result;
+            var result=new Snapshot { Preview=gesture.Pending&&gesture.Dragging&&!discarded?(Rectangle?)gesture.Rect:null,Born=born,Completed=new List<Stroke>(completed),Clear=clearRequested };
+            completed.Clear(); clearRequested=false; return result;
         }
     }
     IntPtr OnMouse(int code,IntPtr message,IntPtr data) {
@@ -135,19 +172,21 @@ class MouseInput : IDisposable {
         System.Threading.Interlocked.Increment(ref SeenEvents);
         var m=(Native.Mouse)Marshal.PtrToStructure(data,typeof(Native.Mouse));
         if((m.Flags&1)!=0) return Native.CallNextHookEx(hook,code,message,data);
-        int action=ProcessMouse(message.ToInt32(),new Point(m.Point.X,m.Point.Y));
-        if((action&2)!=0) dispatcher.BeginInvoke(new Action(delegate { Native.mouse_event(0x0008|0x0010,0,0,0,UIntPtr.Zero); }));
+        int button=(message.ToInt32()==0x20b || message.ToInt32()==0x20c)?(int)(m.Data>>16)+3:2;
+        int action=ProcessMouse(message.ToInt32(),new Point(m.Point.X,m.Point.Y),button,(Native.GetAsyncKeyState(0x12)&0x8000)!=0);
+        if((action&2)!=0) dispatcher.BeginInvoke(new Action(delegate { Native.mouse_event(button==2?0x18u:0x180u,0,0,button==2?0u:(uint)(button-3),UIntPtr.Zero); }));
         return (action&1)!=0?(IntPtr)1:Native.CallNextHookEx(hook,code,message,data);
     }
-    int ProcessMouse(int msg,Point point) {
+    public static bool Matches(TriggerMode mode,int button,bool alt) { return mode==TriggerMode.Right?button==2:mode==TriggerMode.AltRight?button==2&&alt:mode==TriggerMode.SideBack?button==4:button==5; }
+    int ProcessMouse(int msg,Point point,int button=2,bool alt=false) {
         bool suppress=false,replay=false;
         lock(gate) {
             lastInput=clock.ElapsedMilliseconds; lastPoint=point;
-            if(msg==0x204 && enabled) { gesture.Down(lastPoint); born=lastInput; discarded=false; suppress=true; }
+            if((msg==0x204 || msg==0x20b) && enabled && !appExcluded && !gesture.Pending && Matches(trigger,button,alt)) { gesture.Down(lastPoint); heldButton=button; born=lastInput; discarded=false; suppress=true; }
             else if(msg==0x200 && gesture.Pending) {
                 bool wasDragging=gesture.Dragging; gesture.Move(lastPoint);
                 if(!wasDragging && gesture.Dragging) born=lastInput;
-            } else if(msg==0x205 && gesture.Pending) {
+            } else if((msg==0x205 || msg==0x20c) && gesture.Pending && button==heldButton) {
                 bool click=gesture.Up(lastPoint); suppress=true;
                 if(!discarded) {
                     if(click) replay=true;
@@ -168,19 +207,44 @@ class MouseInput : IDisposable {
         Snapshot released=Read();
         if(released.Preview.HasValue || released.Completed.Count!=1 || released.Completed[0].Released<releaseTime) throw new Exception("Release must start the lifetime exactly once");
     }
+    public void TestTriggersAndEscape() {
+        dispatcher.Invoke(new Action(delegate {
+            Configure(TriggerMode.AltRight,"");
+            if(ProcessMouse(0x204,new Point(0,0),2,false)!=0) throw new Exception("Plain right click intercepted in Alt mode");
+            if(ProcessMouse(0x204,new Point(0,0),2,true)!=1 || ProcessMouse(0x205,new Point(0,0),2,false)!=3) throw new Exception("Alt click replay failed");
+            Configure(TriggerMode.SideBack,"");
+            if(ProcessMouse(0x20b,new Point(0,0),5)!=0 || ProcessMouse(0x20b,new Point(0,0),4)!=1) throw new Exception("Wrong side button intercepted");
+            ProcessMouse(0x200,new Point(60,70));
+            if(ProcessMouse(0x205,new Point(60,70),2)!=0 || !Read().Preview.HasValue) throw new Exception("Unrelated release ended drag");
+            IntPtr key=Marshal.AllocHGlobal(24);
+            try {
+                Marshal.WriteInt32(key,27);
+                if(OnKeyboard(0,(IntPtr)0x100,key)!=(IntPtr)1 || !Read().Clear || Read().Preview.HasValue) throw new Exception("Escape failed to cancel drag");
+                if(OnKeyboard(0,(IntPtr)0x100,key)!=(IntPtr)1 || OnKeyboard(0,(IntPtr)0x101,key)!=(IntPtr)1) throw new Exception("Escape repeat / release leaked");
+            } finally { Marshal.FreeHGlobal(key); }
+            if(ProcessMouse(0x20c,new Point(60,70),4)!=1 || Read().Completed.Count!=0) throw new Exception("Cancelled drag completed or replayed");
+            Configure(TriggerMode.SideForward,"");
+            if(ProcessMouse(0x20b,new Point(0,0),5)!=1 || ProcessMouse(0x20c,new Point(0,0),5)!=3) throw new Exception("Side click replay failed");
+            appExcluded=true;
+            if(ProcessMouse(0x20b,new Point(0,0),5)!=0) throw new Exception("Excluded application intercepted");
+            appExcluded=false; Configure(TriggerMode.Right,"");
+        }));
+    }
     public void Dispose() { stopping=true; if(thread.Join(2000)) ready.Dispose(); }
 }
 
 class Frame {
     public const int FadeMilliseconds=500;
     public Rectangle Rect; public Color Color; public long Until, Born; public FrameStyle Style;
+    public int FadeDuration=FadeMilliseconds;
     public float Opacity(long now) {
-        float t=Math.Max(0,Math.Min(1,(Until-now)/(float)FadeMilliseconds));
+        float t=Math.Max(0,Math.Min(1,(Until-now)/(float)Math.Max(1,FadeDuration)));
         return t*t*(3-2*t);
     }
 }
 
 static class Rainbow {
+    public static float WidthScale=1,GlowScale=1;
     public static readonly string[] StyleNames={"赛博霓虹","彩虹辉光","经典彩虹（无辉光）","冰蓝极光","琥珀全息","薄荷流光","夜城协议 · 2077"};
     static readonly Color[][] Palettes={
         new Color[]{Color.FromArgb(0,245,255),Color.FromArgb(38,121,255),Color.FromArgb(167,52,255),Color.FromArgb(255,24,182),Color.FromArgb(0,245,255)},
@@ -208,7 +272,7 @@ static class Rainbow {
                 var blend=new ColorBlend(33);
                 for(int i=0;i<33;i++) { blend.Positions[i]=i/32f; blend.Colors[i]=Color.FromArgb((int)(255*opacity),solid.IsEmpty?Hue(phase+(offset+length*i/32f)/perimeter,style):solid); }
                 brush.InterpolationColors=blend; brush.WrapMode=WrapMode.TileFlipXY;
-                using(var pen=new Pen(brush,width)) { pen.StartCap=LineCap.Square; pen.EndCap=LineCap.Square; g.DrawLine(pen,points[edge],points[edge+1]); }
+                using(var pen=new Pen(brush,width*WidthScale)) { pen.StartCap=LineCap.Square; pen.EndCap=LineCap.Square; g.DrawLine(pen,points[edge],points[edge+1]); }
             }
             offset+=length;
         }
@@ -217,11 +281,11 @@ static class Rainbow {
         if(style==FrameStyle.NightCity) { NightCity(g,r,1,0,opacity,phase); return; }
         g.SmoothingMode=SmoothingMode.AntiAlias;
         if(style==FrameStyle.Classic) { Draw(g,r,5,phase,opacity,solid,style); return; }
-        Draw(g,r,23,phase,opacity*0.018f,solid,style);
-        Draw(g,r,19,phase,opacity*0.028f,solid,style);
-        Draw(g,r,15,phase,opacity*0.045f,solid,style);
-        Draw(g,r,11,phase,opacity*0.075f,solid,style);
-        Draw(g,r,8,phase,opacity*0.14f,solid,style);
+        Draw(g,r,23,phase,opacity*0.018f*GlowScale,solid,style);
+        Draw(g,r,19,phase,opacity*0.028f*GlowScale,solid,style);
+        Draw(g,r,15,phase,opacity*0.045f*GlowScale,solid,style);
+        Draw(g,r,11,phase,opacity*0.075f*GlowScale,solid,style);
+        Draw(g,r,8,phase,opacity*0.14f*GlowScale,solid,style);
         Draw(g,r,5,phase,opacity,solid,style);
         Draw(g,r,1,phase,opacity*0.30f,Color.FromArgb(214,252,255),style);
         if(style==FrameStyle.Aurora && r.Width>=32 && r.Height>=32) {
@@ -267,10 +331,10 @@ static class Rainbow {
         float alpha=opacity*Glitch(exit);
         Color yellow=Color.FromArgb(252,238,10),cyan=Color.FromArgb(29,244,255),red=Color.FromArgb(255,47,87);
         g.SmoothingMode=SmoothingMode.AntiAlias;
-        using(var glow=new Pen(Color.FromArgb((int)(22*alpha),yellow),19)) g.DrawLines(glow,shape);
-        using(var glow=new Pen(Color.FromArgb((int)(42*alpha),yellow),12)) g.DrawLines(glow,shape);
+        using(var glow=new Pen(Color.FromArgb((int)(22*alpha*GlowScale),yellow),19*WidthScale)) g.DrawLines(glow,shape);
+        using(var glow=new Pen(Color.FromArgb((int)(42*alpha*GlowScale),yellow),12*WidthScale)) g.DrawLines(glow,shape);
         using(var dark=new Pen(Color.FromArgb((int)(210*alpha),Color.FromArgb(12,14,18)),8)) g.DrawLines(dark,shape);
-        using(var line=new Pen(Color.FromArgb((int)(255*alpha),yellow),4)) g.DrawLines(line,shape);
+        using(var line=new Pen(Color.FromArgb((int)(255*alpha),yellow),4*WidthScale)) g.DrawLines(line,shape);
         if(w<40 || h<30) return;
         using(var accent=new Pen(Color.FromArgb((int)(235*alpha),cyan),2)) {
             g.DrawLine(accent,r.Left+cut+8,r.Top+5,r.Right-12,r.Top+5);
@@ -320,8 +384,8 @@ static class Rainbow {
             float x=(dx<0?r.Left:r.Right)+dx*gap,y=(dy<0?r.Top:r.Bottom)+dy*gap;
             var points=new PointF[]{new PointF(x,y-dy*arm),new PointF(x,y-dy*8),new PointF(x-dx*8,y),new PointF(x-dx*arm,y)};
             Color tint=corner%2==0?cyan:yellow;
-            using(var pen=new Pen(Color.FromArgb((int)(25*opacity),tint),12)) g.DrawLines(pen,points);
-            using(var pen=new Pen(Color.FromArgb((int)(85*opacity),tint),6)) g.DrawLines(pen,points);
+            using(var pen=new Pen(Color.FromArgb((int)(25*opacity*GlowScale),tint),12)) g.DrawLines(pen,points);
+            using(var pen=new Pen(Color.FromArgb((int)(85*opacity*GlowScale),tint),6)) g.DrawLines(pen,points);
             using(var pen=new Pen(Color.FromArgb((int)(250*opacity),tint),2)) g.DrawLines(pen,points);
             using(var square=new SolidBrush(Color.FromArgb((int)(240*opacity),red))) g.FillRectangle(square,x-dx*arm-2,y-2,4,4);
         }
@@ -335,7 +399,7 @@ static class Rainbow {
             p.X+=nx*fly; p.Y+=ny*fly; tail.X+=nx*fly; tail.Y+=ny*fly;
             Color tint=i%3==0?red:cyan;
             using(var pen=new Pen(Color.FromArgb((int)(190*opacity),tint),2)) g.DrawLine(pen,tail,p);
-            using(var halo=new SolidBrush(Color.FromArgb((int)(32*opacity),tint))) g.FillEllipse(halo,p.X-5,p.Y-5,10,10);
+            using(var halo=new SolidBrush(Color.FromArgb((int)(32*opacity*GlowScale),tint))) g.FillEllipse(halo,p.X-5,p.Y-5,10,10);
             using(var core=new SolidBrush(Color.FromArgb((int)(245*opacity),Color.White))) g.FillRectangle(core,p.X-1,p.Y-1,2,2);
         }
         if(r.Width<180 || r.Height<90) return;
@@ -384,276 +448,25 @@ static class Rainbow {
     }
 }
 
-class FocusShade : Form {
-    string geometry="";
-    public FocusShade() {
-        FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false; TopMost=true;
-        StartPosition=FormStartPosition.Manual; BackColor=Color.Black; Opacity=0;
-    }
-    protected override bool ShowWithoutActivation { get { return true; } }
-    protected override CreateParams CreateParams { get { var c=base.CreateParams; c.ExStyle|=0x08000000|0x00000020|0x00080000|0x00000080; return c; } }
-    public static double Strength(long age,float fade) {
-        double t=Math.Max(0,Math.Min(1,age/280.0));
-        return 0.46*t*t*(3-2*t)*fade;
-    }
-    public static Region Mask(Rectangle screen,IEnumerable<Rectangle> holes) {
-        var region=new Region(new Rectangle(0,0,screen.Width,screen.Height));
-        foreach(var rect in holes) {
-            var hole=rect; hole.Offset(-screen.Left,-screen.Top);
-            if(hole.Width>0 && hole.Height>0) region.Exclude(hole);
-        }
-        return region;
-    }
-    public void UpdateShade(List<Rectangle> holes,double strength) {
-        if(strength<=0.001 || holes.Count==0) { Hide(); return; }
-        Rectangle screen=SystemInformation.VirtualScreen;
-        var key=new StringBuilder(screen.ToString());
-        foreach(var hole in holes) key.Append(hole.ToString());
-        string next=key.ToString();
-        if(next!=geometry) {
-            Bounds=screen;
-            Region old=Region;
-            Region=Mask(screen,holes);
-            if(old!=null) old.Dispose();
-            geometry=next;
-        }
-        Opacity=strength;
-        if(!Visible) Show();
-    }
-}
-
-class Overlay : Form {
-    public readonly List<Frame> Frames=new List<Frame>();
-    public Rectangle? Preview { get; set; }
-    public Color PreviewColor=Color.Empty;
-    public FrameStyle PreviewStyle;
-    public long PreviewBorn;
-    readonly Stopwatch animation=Stopwatch.StartNew();
-    public long Now;
-    public bool FocusEnabled=true;
-    readonly FocusShade shade=new FocusShade();
-    public bool ShadeVisible { get { return shade.Visible; } }
-    public Overlay() {
-        FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false; TopMost=true;
-        StartPosition=FormStartPosition.Manual;
-    }
-    protected override bool ShowWithoutActivation { get { return true; } }
-    protected override CreateParams CreateParams { get { var c=base.CreateParams; c.ExStyle|=0x08000000|0x00000020|0x00080000|0x00000080; return c; } }
-    public void RefreshFrames() {
-        if(Frames.Count==0 && !Preview.HasValue) { shade.Hide(); Hide(); return; }
-        var holes=new List<Rectangle>(); double shadeStrength=0;
-        foreach(var frame in Frames) {
-            holes.Add(frame.Rect);
-            shadeStrength=Math.Max(shadeStrength,FocusShade.Strength(Now-frame.Born,frame.Opacity(Now)));
-        }
-        if(Preview.HasValue) {
-            holes.Add(Preview.Value);
-            shadeStrength=Math.Max(shadeStrength,FocusShade.Strength(Now-PreviewBorn,1));
-        }
-        bool wasVisible=shade.Visible;
-        shade.UpdateShade(holes,FocusEnabled?shadeStrength:0);
-        if(!wasVisible && shade.Visible && Visible) Native.SetWindowPos(Handle,new IntPtr(-1),0,0,0,0,0x0013);
-        Rectangle bounds=Preview.HasValue?Preview.Value:Frames[0].Rect;
-        foreach(var frame in Frames) bounds=Rectangle.Union(bounds,frame.Rect);
-        bounds.Inflate(80,80);
-        bounds=Rectangle.Intersect(bounds,SystemInformation.VirtualScreen);
-        if(bounds.Width<=0 || bounds.Height<=0) { Hide(); return; }
-        using(var bitmap=new Bitmap(bounds.Width,bounds.Height,PixelFormat.Format32bppArgb)) {
-            using(var g=Graphics.FromImage(bitmap)) {
-                g.Clear(Color.Transparent);
-                foreach(var frame in Frames) Draw(g,frame.Rect,frame.Color,frame.Opacity(Now),bounds.Location,frame.Style,frame.Born,Math.Max(0,1-(frame.Until-Now)/(float)Frame.FadeMilliseconds));
-                if(Preview.HasValue) Draw(g,Preview.Value,PreviewColor,1,bounds.Location,PreviewStyle,PreviewBorn,0);
-            }
-            if(!Visible) Show();
-            IntPtr dc=Native.CreateCompatibleDC(IntPtr.Zero),image=IntPtr.Zero,old=IntPtr.Zero;
-            try {
-                image=bitmap.GetHbitmap(Color.FromArgb(0)); old=Native.SelectObject(dc,image);
-                var position=new Native.Point { X=bounds.Left,Y=bounds.Top };
-                var size=new Native.Size { X=bounds.Width,Y=bounds.Height };
-                var origin=new Native.Point(); var blend=new Native.Blend { Alpha=255,Format=1 };
-                if(!Native.UpdateLayeredWindow(Handle,IntPtr.Zero,ref position,ref size,dc,ref origin,0,ref blend,2))
-                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-            } finally {
-                if(old!=IntPtr.Zero) Native.SelectObject(dc,old);
-                if(image!=IntPtr.Zero) Native.DeleteObject(image);
-                if(dc!=IntPtr.Zero) Native.DeleteDC(dc);
-            }
-        }
-    }
-    protected override void OnPaintBackground(PaintEventArgs e) { }
-    protected override void OnPaint(PaintEventArgs e) { }
-    protected override void Dispose(bool disposing) { if(disposing) shade.Dispose(); base.Dispose(disposing); }
-    void Draw(Graphics g,Rectangle r,Color color,float opacity,Point origin,FrameStyle style,long born,float exit) {
-        r.Offset(-origin.X,-origin.Y);
-        if(style==FrameStyle.NightCity) Rainbow.NightCity(g,r,Rainbow.Deploy(Now-born),exit,opacity,-animation.Elapsed.TotalSeconds/9.0);
-        else Rainbow.Glow(g,r,-animation.Elapsed.TotalSeconds/9.0,opacity,color,style);
-    }
-}
-
-class SavedSettings {
-    public FrameStyle Style=FrameStyle.NightCity;
-    public Color Color=Color.Empty;
-    public int Duration=1500;
-    public bool Enabled=true,Focus=true;
-    public static SavedSettings Load(string path) {
-        var result=new SavedSettings();
-        if(!File.Exists(path)) return result;
-        foreach(string line in File.ReadAllLines(path)) {
-            int index=line.IndexOf('='); if(index<0) continue;
-            string key=line.Substring(0,index).Trim(),value=line.Substring(index+1).Trim();
-            int number; bool flag; FrameStyle style;
-            if(key=="Style" && Enum.TryParse<FrameStyle>(value,out style) && Enum.IsDefined(typeof(FrameStyle),style)) result.Style=style;
-            if(key=="Color" && int.TryParse(value,out number)) {
-                foreach(Color color in new Color[]{Color.OrangeRed,Color.DeepSkyBlue,Color.LimeGreen,Color.Gold,Color.MediumPurple})
-                    if(number==color.ToArgb()) result.Color=color;
-            }
-            if(key=="Duration" && int.TryParse(value,out number) && Array.IndexOf(new int[]{0,1000,1500,2000,3000},number)>=0) result.Duration=number;
-            if(key=="Enabled" && bool.TryParse(value,out flag)) result.Enabled=flag;
-            if(key=="Focus" && bool.TryParse(value,out flag)) result.Focus=flag;
-        }
-        if(!result.Color.IsEmpty) result.Style=FrameStyle.Rainbow;
-        return result;
-    }
-    public void Save(string path) {
-        string temp=path+"."+Guid.NewGuid().ToString("N")+".tmp";
-        try {
-            File.WriteAllLines(temp,new string[]{"Version=1","Style="+Style,"Color="+(Color.IsEmpty?0:Color.ToArgb()),"Duration="+Duration,"Enabled="+Enabled,"Focus="+Focus},Encoding.UTF8);
-            if(File.Exists(path)) File.Replace(temp,path,path+".bak");
-            else File.Move(temp,path);
-        } finally { if(File.Exists(temp)) File.Delete(temp); }
-    }
-}
-
-class Controller : Form {
-    readonly Overlay overlay=new Overlay();
-    readonly Stopwatch clock=Stopwatch.StartNew();
-    readonly Timer timer=new Timer();
-    readonly NotifyIcon tray=new NotifyIcon();
-    readonly MouseInput input;
-    bool enabled=true;
-    Color color=Color.Empty;
-    FrameStyle style=FrameStyle.NightCity;
-    readonly Icon trayIcon=Rainbow.TrayIcon();
-    int duration=1500;
-    readonly ToolStripMenuItem toggle=new ToolStripMenuItem("暂停画框");
-    readonly string settingsPath=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"settings.ini");
-    readonly bool persistSettings;
-    bool initialized,saveErrorShown;
-    public Controller(bool smoke) {
-        persistSettings=!smoke;
-        if(persistSettings) {
-            try {
-                var saved=SavedSettings.Load(settingsPath);
-                style=saved.Style; color=saved.Color; duration=saved.Duration; enabled=saved.Enabled; overlay.FocusEnabled=saved.Focus;
-            } catch(IOException) { } catch(UnauthorizedAccessException) { }
-        }
-        Text="QuickFrame · 屏幕画框";
-        ShowInTaskbar=false;
-        var handle=Handle;
-        var menu=new ContextMenuStrip();
-        menu.Items.Add("QuickFrame · 右键拖动画框").Enabled=false;
-        menu.Items.Add(toggle); toggle.Click+=delegate { Toggle(); };
-        var styles=new ToolStripMenuItem("外观预设");
-        foreach(FrameStyle value in Enum.GetValues(typeof(FrameStyle))) {
-            FrameStyle selected=value; var item=new ToolStripMenuItem(Rainbow.StyleNames[(int)value]); item.Checked=value==style && color.IsEmpty;
-            item.Click+=delegate { style=selected; color=Color.Empty; foreach(ToolStripItem sibling in styles.DropDownItems) { var option=sibling as ToolStripMenuItem; if(option!=null) option.Checked=option==item; } SaveSettings(); };
-            styles.DropDownItems.Add(item);
-        }
-        menu.Items.Add(styles);
-        styles.DropDownItems.Add(new ToolStripSeparator());
-        string[] names={"纯色 · 橙红","纯色 · 蓝色","纯色 · 绿色","纯色 · 黄色","纯色 · 紫色"};
-        Color[] values={Color.OrangeRed,Color.DeepSkyBlue,Color.LimeGreen,Color.Gold,Color.MediumPurple};
-        for(int i=0;i<names.Length;i++) {
-            Color value=values[i]; var item=new ToolStripMenuItem(names[i]); item.Checked=!color.IsEmpty && color.ToArgb()==value.ToArgb();
-            item.Click+=delegate { color=value; style=FrameStyle.Rainbow; foreach(ToolStripItem sibling in styles.DropDownItems) { var option=sibling as ToolStripMenuItem; if(option!=null) option.Checked=option==item; } SaveSettings(); };
-            styles.DropDownItems.Add(item);
-        }
-        var times=new ToolStripMenuItem("渐隐前停留时间（渐隐 0.5 秒）");
-        foreach(int ms in new int[]{0,1000,1500,2000,3000}) {
-            int value=ms; var item=new ToolStripMenuItem(ms==0?"无停留（松开即渐隐）":(ms/1000.0).ToString("0.0")+" 秒"); item.Checked=ms==duration;
-            item.Click+=delegate { duration=value; foreach(ToolStripMenuItem sibling in times.DropDownItems) sibling.Checked=sibling==item; SaveSettings(); };
-            times.DropDownItems.Add(item);
-        }
-        menu.Items.Add(times);
-        var focus=new ToolStripMenuItem("聚焦遮罩 · 框外渐暗") { Checked=overlay.FocusEnabled,CheckOnClick=true };
-        focus.Click+=delegate { overlay.FocusEnabled=focus.Checked; overlay.RefreshFrames(); SaveSettings(); };
-        menu.Items.Add(focus);
-        menu.Items.Add("清除所有框",null,delegate { Clear(); });
-        menu.Items.Add("修复鼠标监听",null,delegate { input.Repair(); Clear(); tray.ShowBalloonTip(2000,"QuickFrame","正在重新连接鼠标监听。",ToolTipIcon.Info); });
-        menu.Items.Add("退出",null,delegate { Application.Exit(); });
-        tray.Icon=trayIcon; tray.Text="QuickFrame · 右键菜单切换风格";
-        tray.ContextMenuStrip=menu; tray.DoubleClick+=delegate { Toggle(); }; tray.Visible=true;
-        input=new MouseInput(clock);
-        input.SetEnabled(enabled);
-        toggle.Text=enabled?"暂停画框":"恢复画框";
-        tray.Text=enabled?"QuickFrame · 已开启":"QuickFrame · 已暂停";
-        initialized=true;
-        bool hotkey=Native.RegisterHotKey(Handle,1,0x4003,(uint)Keys.F8);
-        bool shadeWasShown=false;
-        timer.Interval=33;
-        timer.Tick+=delegate {
-            if(Program.ShowRequest!=null && Program.ShowRequest.WaitOne(0)) {
-                tray.ShowBalloonTip(2000,"QuickFrame 已在运行","请右键点击霓虹方框托盘图标进行设置。",ToolTipIcon.Info);
-            }
-            overlay.Now=clock.ElapsedMilliseconds;
-            var snapshot=input.Read();
-            overlay.Preview=snapshot.Preview; overlay.PreviewBorn=snapshot.Born;
-            overlay.PreviewColor=color; overlay.PreviewStyle=style;
-            foreach(var stroke in snapshot.Completed) overlay.Frames.Add(new Frame { Rect=stroke.Rect,Color=color,Style=style,Born=stroke.Born,Until=stroke.Released+duration+Frame.FadeMilliseconds });
-            overlay.Frames.RemoveAll(f=>f.Until<=overlay.Now);
-            if(overlay.Visible || overlay.Frames.Count>0 || overlay.Preview.HasValue) overlay.RefreshFrames();
-            if(overlay.ShadeVisible) shadeWasShown=true;
-        };
-        timer.Start();
-        if(smoke) {
-            foreach(FrameStyle sample in Enum.GetValues(typeof(FrameStyle)))
-                overlay.Frames.Add(new Frame { Rect=new Rectangle(30+((int)sample%3)*200,30+((int)sample/3)*130,170,95),Color=color,Style=sample,Born=clock.ElapsedMilliseconds,Until=clock.ElapsedMilliseconds+200+Frame.FadeMilliseconds });
-            overlay.RefreshFrames();
-            var finish=new Timer { Interval=1000 };
-            finish.Tick+=delegate {
-                finish.Stop(); finish.Dispose();
-                Program.SmokePassed=shadeWasShown && overlay.Frames.Count==0 && !overlay.Visible && !overlay.ShadeVisible && input.Installed && !Visible && !ShowInTaskbar && tray.Visible;
-                Application.Exit();
-            };
-            finish.Start();
-        } else {
-            SaveSettings();
-            string status=enabled?(duration==0?"松开右键立即开始 0.5 秒消散。":"松开后停留 "+(duration/1000.0).ToString("0.0")+" 秒，再消散 0.5 秒。"):"已恢复上次的暂停状态。";
-            tray.ShowBalloonTip(3500,"QuickFrame 已启动",status+(hotkey?"\nCtrl+Alt+F8 暂停或恢复。":"\n快捷键已被占用，请使用托盘菜单暂停。"),ToolTipIcon.Info);
-        }
-    }
-    void Clear() { input.Cancel(); overlay.Frames.Clear(); overlay.Preview=null; overlay.RefreshFrames(); }
-    void Toggle() { enabled=!enabled; input.SetEnabled(enabled); toggle.Text=enabled?"暂停画框":"恢复画框"; tray.Text=enabled?"QuickFrame · 已开启":"QuickFrame · 已暂停"; Clear(); SaveSettings(); }
-    void SaveSettings() {
-        if(!persistSettings || !initialized) return;
-        try {
-            new SavedSettings { Style=style,Color=color,Duration=duration,Enabled=enabled,Focus=overlay.FocusEnabled }.Save(settingsPath);
-            saveErrorShown=false;
-        } catch(Exception e) {
-            if(!(e is IOException) && !(e is UnauthorizedAccessException)) throw;
-            if(!saveErrorShown) tray.ShowBalloonTip(3500,"QuickFrame 设置未能保存","请将程序放在可写目录中。"+e.Message,ToolTipIcon.Warning);
-            saveErrorShown=true;
-        }
-    }
-    protected override void OnFormClosing(FormClosingEventArgs e) {
-        if(e.CloseReason==CloseReason.UserClosing) { e.Cancel=true; Hide(); }
-        base.OnFormClosing(e);
-    }
-    protected override void WndProc(ref Message m) { if(m.Msg==0x312 && m.WParam.ToInt32()==1) Toggle(); base.WndProc(ref m); }
-    protected override void Dispose(bool disposing) {
-        if(disposing) SaveSettings();
-        Native.UnregisterHotKey(Handle,1);
-        if(disposing) { timer.Dispose(); if(input!=null) input.Dispose(); tray.Visible=false; tray.Dispose(); trayIcon.Dispose(); overlay.Dispose(); }
-        base.Dispose(disposing);
-    }
-}
-
 static class Program {
     public static bool SmokePassed;
     public static System.Threading.EventWaitHandle ShowRequest;
+    public static System.Threading.EventWaitHandle SettingsRequest;
     [STAThread] static int Main(string[] args) {
         bool test=Array.IndexOf(args,"--self-test")>=0;
         bool smoke=Array.IndexOf(args,"--smoke-test")>=0;
+        bool showSettings=Array.IndexOf(args,"--settings")>=0;
+        if(Array.IndexOf(args,"--ui-test")>=0) {
+            Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+            try { Checks.UserInterface(); File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"ui-test.txt"),"PASS: defaults, preview draft, save, reset, cancel, and panel rendering."); return 0; }
+            catch(Exception e) { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"ui-test.txt"),e.ToString()); return 1; }
+        }
+        if(Array.IndexOf(args,"--settings-demo")>=0) {
+            try { Native.SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch(EntryPointNotFoundException) { Native.SetProcessDPIAware(); }
+            Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+            using(var window=new SettingsWindow(new SavedSettings(),delegate(SavedSettings s) { s.Save(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"ui-test.ini")); return true; })) Application.Run(window);
+            return 0;
+        }
         if(Array.IndexOf(args,"--settings-test")>=0) {
             string path=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"settings-test-"+Guid.NewGuid().ToString("N")+".ini");
             try {
@@ -665,11 +478,12 @@ static class Program {
                 foreach(Color color in new Color[]{Color.OrangeRed,Color.DeepSkyBlue,Color.LimeGreen,Color.Gold,Color.MediumPurple}) {
                     new SavedSettings { Style=FrameStyle.Rainbow,Color=color,Duration=3000 }.Save(path);
                     var restored=SavedSettings.Load(path);
-                    if(restored.Color.ToArgb()!=color.ToArgb() || restored.Style!=FrameStyle.Rainbow || restored.Duration!=3000 || !restored.Enabled || !restored.Focus) throw new Exception("Solid preset did not restore");
+                    if(restored.Color.ToArgb()!=color.ToArgb() || restored.Style!=FrameStyle.Rainbow || restored.Duration!=3000 || !restored.Enabled || restored.Focus) throw new Exception("Solid preset did not restore");
                 }
                 File.WriteAllText(path,"Style=999\nColor=bad\nDuration=-1\nEnabled=bad\nFocus=False\nFutureKey=hello");
                 var fallback=SavedSettings.Load(path);
-                if(fallback.Style!=FrameStyle.NightCity || fallback.Duration!=1500 || !fallback.Color.IsEmpty || !fallback.Enabled || fallback.Focus) throw new Exception("Invalid settings handling failed");
+                if(fallback.Style!=FrameStyle.Rainbow || fallback.Duration!=0 || !fallback.Color.IsEmpty || !fallback.Enabled || fallback.Focus) throw new Exception("Invalid settings handling failed");
+                Checks.Settings(path);
                 File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"settings-test.txt"),"PASS: seven style presets, five solid colors, zero delay, pause/focus toggles, atomic overwrite, invalid-field fallback."); return 0;
             } catch(Exception e) { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"settings-test.txt"),e.ToString()); return 1; }
             finally { if(File.Exists(path)) File.Delete(path); if(File.Exists(path+".bak")) File.Delete(path+".bak"); }
@@ -684,8 +498,9 @@ static class Program {
                     listener.Repair(); System.Threading.Thread.Sleep(500);
                     if(System.Threading.Interlocked.Read(ref listener.InstallCount)<=installs || !listener.Installed) throw new Exception("Repair failed");
                     listener.TestHeldDrag();
+                    listener.TestTriggersAndEscape();
                 }
-                File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"worker-test.txt"),"PASS: worker survives main-thread stall; repair succeeds; stationary held drag survives 2.4 seconds of watchdog ticks; only release completes the stroke and sets its lifetime. No physical mouse clicks were injected."); return 0;
+                File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"worker-test.txt"),"PASS: worker survives main-thread stall; repair succeeds; stationary held drag survives 2.4 seconds; release starts lifetime; Alt and side-button triggers; click replay flags; Esc cancellation and key repeat; excluded app passthrough. No physical mouse clicks were injected."); return 0;
             } catch(Exception e) { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"worker-test.txt"),e.ToString()); return 1; }
         }
         if(Array.IndexOf(args,"--render-preview")>=0) {
@@ -718,6 +533,7 @@ static class Program {
         }
         if(test) {
             try {
+                Checks.Rendering();
                 var g=new Gesture(); g.Down(new Point(100,100));
                 if(!g.Up(new Point(103,102))) throw new Exception("Click misclassified");
                 g.Down(new Point(100,100)); g.Move(new Point(92,100));
@@ -744,14 +560,15 @@ static class Program {
             } catch(Exception e) { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"self-test.txt"),e.ToString()); return 1; }
         }
         bool fresh;
-        string instance="Local\\QuickFrame-MVP-"+Native.DesktopName();
+        string instance="Local\\QuickFrame-MVP-"+Native.DesktopName()+(smoke?"-SmokeTest":"");
         using(var mutex=new System.Threading.Mutex(true,instance,out fresh))
-        using(ShowRequest=new System.Threading.EventWaitHandle(false,System.Threading.EventResetMode.AutoReset,instance+"-Show")) {
-            if(!fresh) { ShowRequest.Set(); return 0; }
+        using(ShowRequest=new System.Threading.EventWaitHandle(false,System.Threading.EventResetMode.AutoReset,instance+"-Show"))
+        using(SettingsRequest=new System.Threading.EventWaitHandle(false,System.Threading.EventResetMode.AutoReset,instance+"-Settings")) {
+            if(!fresh) { if(smoke) return 2; if(showSettings) SettingsRequest.Set(); else ShowRequest.Set(); return 0; }
             try {
                 try { Native.SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch(EntryPointNotFoundException) { Native.SetProcessDPIAware(); }
                 Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
-                using(var controller=new Controller(smoke)) Application.Run();
+                using(var controller=new Controller(smoke)) { if(showSettings) SettingsRequest.Set(); Application.Run(); }
                 if(smoke) { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"smoke-test.txt"),SmokePassed?"PASS: mouse hook installed; overlay displayed; frame expired and overlay hidden; clean exit.":"FAIL"); return SmokePassed?0:1; }
                 return 0;
             } catch(Exception e) { MessageBox.Show(e.Message,"QuickFrame 启动失败",MessageBoxButtons.OK,MessageBoxIcon.Error); return 1; }

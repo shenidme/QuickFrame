@@ -7,11 +7,12 @@ if (-not (Test-Path -LiteralPath $compiler)) {
 $bin = Join-Path $PSScriptRoot 'bin'
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 $exe = Join-Path $bin 'QuickFrame.exe'
-& $compiler /nologo /target:winexe /optimize+ /platform:anycpu "/out:$exe" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll (Join-Path $PSScriptRoot 'src\QuickFrame.cs')
+& $compiler /nologo /target:winexe /optimize+ /platform:anycpu "/out:$exe" "/win32manifest:$PSScriptRoot\src\app.manifest" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll (Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'src') -Filter '*.cs' | ForEach-Object FullName)
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'src\App.config') -Destination "$exe.config" -Force
 if ($Test -or $InteractiveTests) {
     $checks = @('--self-test', '--settings-test')
-    if ($InteractiveTests) { $checks += @('--smoke-test', '--worker-test') }
+    if ($InteractiveTests) { $checks += @('--smoke-test', '--worker-test', '--ui-test') }
     foreach ($check in $checks) {
         $process = Start-Process -FilePath $exe -ArgumentList $check -WindowStyle Hidden -PassThru
         if (-not $process.WaitForExit(30000)) {
@@ -26,7 +27,7 @@ if ($Test -or $InteractiveTests) {
 if ($Package) {
     $dist = Join-Path $PSScriptRoot 'dist'
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
-    $files = @($exe, (Join-Path $PSScriptRoot 'LICENSE'), (Join-Path $PSScriptRoot 'README.md'), (Join-Path $PSScriptRoot 'docs\usage.zh-CN.md'))
+    $files = @($exe, "$exe.config", (Join-Path $PSScriptRoot 'LICENSE'), (Join-Path $PSScriptRoot 'README.md'), (Join-Path $PSScriptRoot 'docs\usage.zh-CN.md'))
     $archive = Join-Path $dist 'QuickFrame-windows.zip'
     Compress-Archive -LiteralPath $files -DestinationPath $archive -Force
     $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
