@@ -24,6 +24,7 @@ sealed class LayerSurface : IDisposable {
             if(dc==IntPtr.Zero || dib==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             previous=Native.SelectObject(dc,dib);
             bitmap=new Bitmap(Width,Height,Width*4,PixelFormat.Format32bppPArgb,bits);
+            bitmap.SetResolution(96,96);
             Graphics=Graphics.FromImage(bitmap); Allocations++;
         } catch { Dispose(); throw; }
     }

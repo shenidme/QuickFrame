@@ -11,19 +11,29 @@ sealed class PreviewPanel : Panel {
     public PreviewPanel() { DoubleBuffered=true; BackColor=Color.FromArgb(24,29,40); timer.Tick+=delegate { Invalidate(); }; timer.Start(); }
     protected override void OnPaint(PaintEventArgs e) {
         base.OnPaint(e); if(Settings==null) return;
-        int width=Math.Max(1,(int)(Width*96/e.Graphics.DpiX)),height=Math.Max(1,(int)(Height*96/e.Graphics.DpiY));
-        if(canvas==null || canvas.Width!=width || canvas.Height!=height) { if(canvas!=null) canvas.Dispose(); canvas=new Bitmap(width,height); canvas.SetResolution(96,96); }
-        using(var g=Graphics.FromImage(canvas)) Render(g,width,height);
-        e.Graphics.DrawImage(canvas,ClientRectangle);
+        PaintPreview(e.Graphics,ClientSize,e.Graphics.DpiX,e.Graphics.DpiY,clock.ElapsedMilliseconds);
+        TextRenderer.DrawText(e.Graphics,"预览 · 按住 → 松开 → 消散",Font,ClientRectangle,Color.FromArgb(192,206,229),TextFormatFlags.HorizontalCenter|TextFormatFlags.VerticalCenter);
     }
-    void Render(Graphics g,int width,int height) {
+    // Layout follows the monitor DPI; the highlight itself uses desktop pixels.
+    internal static Rectangle FrameBounds(Size pixels,float dpiX,float dpiY) {
+        int x=Math.Min((int)(65*dpiX/96),Math.Max(0,(pixels.Width-1)/2));
+        int y=Math.Min((int)(45*dpiY/96),Math.Max(0,(pixels.Height-1)/2));
+        return new Rectangle(x,y,Math.Max(1,pixels.Width-2*x),Math.Max(1,pixels.Height-2*y));
+    }
+    internal void PaintPreview(Graphics target,Size pixels,float dpiX,float dpiY,long elapsed) {
+        int width=Math.Max(1,pixels.Width),height=Math.Max(1,pixels.Height);
+        if(canvas==null || canvas.Width!=width || canvas.Height!=height) { if(canvas!=null) canvas.Dispose(); canvas=new Bitmap(width,height); canvas.SetResolution(96,96); }
+        using(var g=Graphics.FromImage(canvas)) Render(g,width,height,dpiX,dpiY,elapsed);
+        target.DrawImage(canvas,new Rectangle(0,0,width,height),0,0,width,height,GraphicsUnit.Pixel);
+    }
+    void Render(Graphics g,int width,int height,float dpiX,float dpiY,long elapsed) {
         g.Clear(BackColor);
         using(var grid=new Pen(Color.FromArgb(35,43,59))) {
-            for(int x=0;x<width;x+=28) g.DrawLine(grid,x,0,x,height);
-            for(int y=0;y<height;y+=28) g.DrawLine(grid,0,y,width,y);
+            for(int x=0;x<width;x+=Math.Max(1,(int)(28*dpiX/96))) g.DrawLine(grid,x,0,x,height);
+            for(int y=0;y<height;y+=Math.Max(1,(int)(28*dpiY/96))) g.DrawLine(grid,0,y,width,y);
         }
-        Rectangle r=new Rectangle(65,45,width-130,height-90);
-        long cycle=2800+Settings.Duration+Settings.Fade,age=clock.ElapsedMilliseconds%cycle;
+        Rectangle r=FrameBounds(new Size(width,height),dpiX,dpiY);
+        long cycle=2800+Settings.Duration+Settings.Fade,age=elapsed%cycle;
         var f=new Frame { Until=cycle,FadeDuration=Settings.Fade };
         float alpha=f.Opacity(age);
         if(Settings.Focus) using(var region=FocusShade.Mask(new Rectangle(0,0,width,height),new Rectangle[]{r}))
@@ -31,13 +41,10 @@ sealed class PreviewPanel : Panel {
         float oldWidth=Rainbow.WidthScale,oldGlow=Rainbow.GlowScale;
         try {
             Rainbow.WidthScale=Settings.Width/5f; Rainbow.GlowScale=Settings.Glow/100f;
-            double phase=-clock.Elapsed.TotalSeconds/Settings.Speed;
+            double phase=-elapsed/1000.0/Settings.Speed;
             if(Settings.Style==FrameStyle.NightCity) Rainbow.NightCity(g,r,Rainbow.Deploy(age),Math.Max(0,1-(cycle-age)/(float)Settings.Fade),alpha,phase);
             else Rainbow.Glow(g,r,phase,alpha,Settings.Color,Settings.Style);
         } finally { Rainbow.WidthScale=oldWidth; Rainbow.GlowScale=oldGlow; }
-        using(var font=new Font("Microsoft YaHei UI",9)) using(var brush=new SolidBrush(Color.FromArgb(192,206,229)))
-            using(var format=new StringFormat { Alignment=StringAlignment.Center,LineAlignment=StringAlignment.Center })
-                g.DrawString("预览 · 按住 → 松开 → 消散",font,brush,new Rectangle(0,0,width,height),format);
     }
     protected override void Dispose(bool disposing) { if(disposing) { timer.Dispose(); if(canvas!=null) canvas.Dispose(); } base.Dispose(disposing); }
 }

@@ -54,6 +54,7 @@ static class Checks {
         } finally { Registry.CurrentUser.DeleteSubKeyTree(testKey,false); }
     }
     public static void Rendering() {
+        PreviewPixels();
         using(var surface=new LayerSurface()) {
             surface.Ensure(120,120); surface.Graphics.Clear(Color.Transparent);
             for(int i=0;i<80;i++) surface.Ensure(100+i%20,100);
@@ -74,6 +75,33 @@ static class Checks {
                 Rainbow.WidthScale=1.8f; Rainbow.GlowScale=1.5f; Rainbow.Glow(g,new Rectangle(60,60,100,100),0.2,1,Color.Empty,style);
                 Require(bitmap.GetPixel(110,110).A==0,"Large style filled interior");
                 g.Clear(Color.Transparent); Rainbow.GlowScale=0; Rainbow.Glow(g,new Rectangle(60,60,100,100),0.2,1,Color.Empty,style);
+            }
+        } finally { Rainbow.WidthScale=Rainbow.GlowScale=1; }
+    }
+    static void PreviewPixels() {
+        try {
+            foreach(int dpi in new int[]{96,144,192,240}) foreach(int thickness in new int[]{3,9}) foreach(FrameStyle style in Enum.GetValues(typeof(FrameStyle))) {
+                var size=new Size(608*dpi/96,195*dpi/96);
+                var rect=new Rectangle(65*dpi/96,45*dpi/96,478*dpi/96,105*dpi/96);
+                // Integer rounding at fractional DPI follows the two panel margins.
+                rect.Width=size.Width-rect.Left*2; rect.Height=size.Height-rect.Top*2;
+                using(var panel=new PreviewPanel()) using(var preview=new Bitmap(size.Width,size.Height)) using(var expected=new Bitmap(size.Width,size.Height)) {
+                    panel.Settings=new SavedSettings { Style=style,Width=thickness,Glow=150 };
+                    preview.SetResolution(dpi,dpi); expected.SetResolution(96,96);
+                    using(var g=Graphics.FromImage(preview)) panel.PaintPreview(g,size,dpi,dpi,1000);
+                    using(var g=Graphics.FromImage(expected)) {
+                        g.Clear(panel.BackColor);
+                        using(var grid=new Pen(Color.FromArgb(35,43,59))) {
+                            for(int x=0;x<size.Width;x+=28*dpi/96) g.DrawLine(grid,x,0,x,size.Height);
+                            for(int y=0;y<size.Height;y+=28*dpi/96) g.DrawLine(grid,0,y,size.Width,y);
+                        }
+                        // Desktop drawing: physical rectangle, 96-DPI backing bitmap, no scaling.
+                        Rainbow.WidthScale=thickness/5f; Rainbow.GlowScale=1.5f;
+                        Rainbow.Glow(g,rect,-1.0/9,1,Color.Empty,style);
+                    }
+                    for(int y=Math.Max(0,rect.Top-35);y<rect.Top+35;y++) for(int x=rect.Left+5;x<rect.Right;x+=11)
+                        Require(preview.GetPixel(x,y).ToArgb()==expected.GetPixel(x,y).ToArgb(),"Preview differs from desktop pixels at DPI "+dpi+", width "+thickness+", style "+style+", point "+x+","+y+": "+preview.GetPixel(x,y)+" / "+expected.GetPixel(x,y));
+                }
             }
         } finally { Rainbow.WidthScale=Rainbow.GlowScale=1; }
     }
